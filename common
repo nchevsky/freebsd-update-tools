@@ -1,0 +1,247 @@
+#!/bin/sh
+
+# compares the contents of two files, returning 1 if they're different and nothing if identical
+# $1: first file
+# $2: second file
+are_files_different() {
+	if [ "$(file_hash "$1")" != "$(file_hash "$2")" ]; then
+		echo 1
+	fi
+}
+
+# checks whether git(1) is functional and offers to install it if missing
+# $1: path to repository (optional)
+# $2: name of Git client package to offer to install (optional)
+check_git_client() {
+	if [ ! "$(which git)" ]; then
+		message=
+		if [ -n "$1" ]; then
+			message="$1 looks like a Git repository, but "
+		fi
+		echo -e "\n${message}git(1) is not installed."
+		if [ -z "$2" ]; then
+			return 1
+		else
+			if [ ! "$(which pkg)" ]; then
+				return 1
+			fi
+			prompt_Yn "Install package \`$GIT_CLIENT_PACKAGE\`?"
+			if [ $(confirm) ]; then
+				pkg install "$GIT_CLIENT_PACKAGE" || return 1
+			else
+				return 1
+			fi
+		fi
+	fi
+}
+
+# checks whether svnlite(1) is functional
+# $1: path to repository (optional)
+check_subversion_client() {
+	if [ ! "$(which svnlite)" ]; then
+		message=
+		if [ -n "$1" ]; then
+			message="$1 looks like a Subversion repository, but "
+		fi
+		echo -e "\n${message}svnlite(1) is not installed."
+		return 1
+	fi
+}
+
+# reads yes/no confirmation input, returning 1 for yes and nothing for no
+# $1: default response: 'Y' or 'y' for yes, 'N' or 'n' for no (optional; defaults to yes)
+confirm() {
+	selection="$(input '[nNyY]|$')"
+	case "$selection" in
+		N|n)	;;
+		Y|y)	echo 1;;
+		*)		case "$1" in
+					N|n)	;;
+					*)		echo 1;
+				esac
+	esac
+}
+
+# returns the console's current number of columns
+console_width() {
+	tput cols
+}
+
+# escapes any special characters in the given string for safe use in a regular expression
+# $1: string to be escaped
+escape_for_regexp() {
+	echo "$1" | sed -e 's/([/.])/\\\1/g' -r
+}
+
+# returns the hash of the given file, or nothing if the file doesn't exist
+# $1: path of file to hash
+file_hash() {
+	if [ -f "$1" ]; then
+		sha256 -q "$1"
+	fi
+}
+
+# returns the file name (if any) from the end of the given path
+# $1: path from which to extract the file name
+file_name_from_path() {
+	echo "$1" | sed -e 's/([^/]*\/)*(.*)/\2/' -r
+}
+
+# prints the given string inside a terminal-wide header
+# $1: string
+header() {
+	columns=$(console_width)
+	repeat '=' "$((columns - 1))"
+	echo "\n$1"
+	repeat '=' "$((columns - 1))"
+}
+
+# reads console input until it matches the given regular expression (whole-line match)
+# $1: regular expression against which to match input
+input() {
+	until [ ]; do
+		read input
+		is_match "$input" "$1" && break
+	done
+}
+
+# interactively merges two given files, saving the result to the latter
+# $1: origin file path
+# $2: destination file path
+interactively_merge_files() {
+	destination_file_path="$2"
+	merged_file_path="${2}.merged"
+	origin_file_path="$1"
+
+	echo
+	sdiff -dsw "$(console_width)" -o "$merged_file_path" \
+			"$origin_file_path" "$destination_file_path"
+	if [ -s "$merged_file_path" -a $(are_files_different "$destination_file_path" \
+			"$merged_file_path") ]; then
+		header 'Beginning of resulting merged file'
+		echo -e '\n'
+		less --QUIT-AT-EOF "$merged_file_path"
+		echo
+		header 'End of resulting merged file'
+		echo
+		prompt_Yn "Write to ${destination_file_path}?"
+		if [ $(confirm) ]; then
+			mv -v "$merged_file_path" "$destination_file_path"
+		else
+			echo '    Changes discarded.'
+		fi
+	else
+		echo '    No changes made.'
+	fi
+	rm "$merged_file_path" 2> /dev/null
+}
+
+# determines whether the given string matches the given regular expression (whole-line match)
+# $1: string to test
+# $2: regular expression against which to match
+is_match() {
+	echo "$1" | egrep --line-regexp "$2"
+}
+
+# prompts for input
+# $1: prompt text
+prompt() {
+	if [ -n "$1" ]; then
+		echo
+		echo -n ">>> $(echo -e "$1") "
+	fi
+}
+
+# prompts for yes/no confirmation, with yes as the default
+# $1: prompt text
+prompt_Yn() {
+	if [ -n "$1" ]; then
+		prompt "$1"
+		echo -n '[Y/n] '
+	fi
+}
+
+# prompts for yes/no confirmation, with no as the default
+# $1: prompt text
+prompt_yN() {
+	if [ -n "$1" ]; then
+		prompt "$1"
+		echo -n '[y/N] '
+	fi
+}
+
+# repeats the given string a certain number of times
+# $1: string to repeat
+# $2: number of repetitions
+repeat() {
+	i=0
+	until [ $i -eq "$2" ]; do
+		echo -n "$1"
+		i="$(($i + 1))"
+	done
+}
+
+# strips the given path or file name of its rightmost file name extension, if any
+# $1: file name or path
+strip_extension() {
+	echo "${1%[.-]?*}"
+}
+
+# strips the last component (file name or directory) from the given path
+# $1: path whose last component is to be stripped
+strip_last_path_component() {
+	echo "${1%/}" | sed -e 's/(.+\/)([^/]*)/\1/' -r
+}
+
+# strips the given path or file name of its file name prefix, if any
+# $1: file name or path
+# $2: a regular expression of one or more prefixes to strip out
+strip_prefixes() {
+	echo "$1" | sed -e "s/(^|.*\/)$2/\1/" -r
+}
+
+# merges differences between two files (e.g. old and new versions of a sample configuration file)
+# into a third file (e.g. a locally modified copy), first attempting an automatic merge and falling
+# back to interactive if that fails
+# $1: path to origin file to be compared to $2
+# $2: path to origin file to be compared to $1
+# $3: path to destination file into which to merge differences between $1 and $2
+# returns 0 if no differences were encountered, or 1 if any were
+three_way_merge_files() {
+	differences_found=
+	need_interaction=1
+	# if both origin files exist and differ, automatically merge differences into destination file
+	if [ -f "$1" -a -f "$2" ]; then
+		if [ ! $(are_files_different "$1" "$2") ]; then
+			need_interaction=
+		else
+			differences_found=1
+			prompt_Yn "$2 differs from $1. Attempt to automatically merge the differences into $3?"
+			if [ $(confirm) ]; then
+				diff --minimal --unified "$1" "$2" | patch -N -r /dev/null -s "$3" > /dev/null
+				if [ $? -eq 0 ]; then
+					echo '    [√] Differences successfully merged.'
+					rm "$3.orig"
+					need_interaction=
+				else
+					if [ $(are_files_different "$3.orig" "$3") ]; then
+						echo -e '    [-] Only some changes applied cleanly:\n'
+						diff --minimal --unified "$3.orig" "$3" | less --QUIT-AT-EOF
+					else
+						echo '    [X] All changes failed to apply.'
+					fi
+				fi
+			fi
+		fi
+	fi
+	# if automatic merging failed or only partially succeeded, offer to interactively merge any
+	# remaining changes
+	if [ $need_interaction ]; then
+		differences_found=1
+		prompt_Yn "Interactively merge $2 and $3?"
+		if [ $(confirm) ]; then
+			interactively_merge_files "$2" "$3"
+		fi
+	fi
+	return $differences_found
+}

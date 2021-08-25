@@ -1,0 +1,326 @@
+#!/bin/sh
+
+####################################################################################################
+# User-serviceable definitions
+####################################################################################################
+
+GIT_CLIENT_PACKAGE='git-tiny'
+GIT_FETCH_ARGS='--depth=1'
+GIT_RESET_ARGS='--keep'
+MAKE_ARGS="-j$(sysctl -n hw.ncpu)"
+MERGEMASTER_ARGS='-FiU'
+PREFER_ETCUPDATE=1
+
+####################################################################################################
+# Internal definitions
+####################################################################################################
+
+KERNCONF_PATH="/usr/src/sys/$(uname -m)/conf"
+MY_PATH="$(dirname "$(readlink -f "$0")")"
+SRC_PATH='/usr/src'
+
+####################################################################################################
+# Utility functions
+####################################################################################################
+
+. "$MY_PATH/common"
+
+# backs up GENERIC and UPDATING so that they can be compared post-upgrade
+back_up_generic_and_updating() {
+	if [ -f "$KERNCONF_PATH/GENERIC" ] ; then
+		cp -fv "$KERNCONF_PATH/GENERIC" "$KERNCONF_PATH/GENERIC.last"
+	fi
+	if [ -f "$SRC_PATH/UPDATING" ]; then
+		cp -fv "$SRC_PATH/UPDATING" "$SRC_PATH/UPDATING.last"
+	fi
+}
+
+# determines whether etcupdate(8) needs bootstrapping
+check_etcupdate() {
+	if [ "$PREFER_ETCUPDATE" -a ! "$(is_etcupdate_functional)" ]; then
+		line1="etcupdate(8) is set as the preferred configuration merging tool, but it needs"
+		line2="to be bootstrapped before its first use. Bootstrapping consists of making a copy"
+		line3="of the stock configuration in $SRC_PATH (which should match the currently running"
+		line4="world) and establishing it as the baseline for detecting local changes."
+		echo -e "$line1\n$line2\n$line3\n$line4"
+		prompt '[B]ootstrap and use etcupdate(8), or [f]all back to mergemaster(8)?'
+		selection="$(input '[bBfF]')"
+		case "$selection" in
+			b|B)	echo -n '    Bootstrapping etcupdate(8); please wait... '
+					etcupdate extract || exit 1
+					echo 'done.'
+					;;
+			f|F)	echo '    Falling back to mergemaster(8).'
+					;;
+		esac
+	fi
+}
+
+# determines whether etcupdate(8) has been bootstrapped and is functional
+is_etcupdate_functional() {
+	etcupdate diff > /dev/null 2>&1 && echo 1
+}
+
+# determines whether the given string is a valid FreeBSD source repository URL
+# $1: source repository URL
+is_repository_url() {
+	branch_regexp='head|stable/[[:digit:]]+|releng/[[:digit:]]+\.[[:digit:]]+'
+	is_match "$1" "^https?://[-.[:alnum:]]+/base/($branch_regexp)/?$" -i
+}
+
+# shows help
+print_usage() {
+	echo "Usage: $0 --stage1 [kernconf]"
+	indent=$(("$(echo "$0" | wc -m)" + 7))
+	repeat ' ' $indent; echo '--stage2'
+	repeat ' ' $indent; echo '--stage3'
+	echo 'Stages:'
+	echo '    --stage1: Updates the source tree, shows changes in UPDATING, merges'
+	echo '              inbound changes to GENERIC into `kernconf` (if one is given),'
+	echo '              builds the userland, and builds and installs the kernel.'
+	echo '      [kernconf]: File name (not path) of the kernel configuration to build.'
+	echo '              Defaults to GENERIC if unspecified.'
+	echo '    --stage2: Installs the userland and merges changes in configuration files.'
+	echo '    --stage3: Upgrades pkg(8), cleans build output, and removes obsolete files.'
+	echo
+}
+
+# builds world and kernel, and installs kernel
+# $1: kernconf (optional; defaults to GENERIC)
+stage1() {
+	# determine kernel to build
+	if [ -n "$1" ]; then
+		if [ -f "$KERNCONF_PATH/$1" ]; then
+			KERNCONF="$1"
+		else
+			echo "Kernel configuration file not found: $KERNCONF_PATH/$1"
+			exit 1
+		fi
+	else
+		KERNCONF='GENERIC'
+	fi
+	echo -e "\nKernel configuration: $KERNCONF"
+
+	# determine the type of source repository and whether the appropriate VCS client is installed
+	is_git_repository=
+	if [ -d "$SRC_PATH/.git" ]; then
+		is_git_repository=1
+		MERGEMASTER_ARGS="$MERGEMASTER_ARGS -s" # don't rely on VCS IDs for comparison
+		check_git_client "$SRC_PATH" "$GIT_CLIENT_PACKAGE" || exit 1
+	else
+		check_subversion_client "$SRC_PATH" || exit 1
+	fi
+
+	# confirm and sync source branch to be built
+	branch=
+	if [ "$is_git_repository" ]; then
+		branch="$(git rev-parse --abbrev-ref HEAD)"
+	else
+		branch="$(svnlite info "$SRC_PATH" | grep '^URL' | awk '{print $2}')"
+	fi
+	if [ -z "$branch" ]; then
+		echo
+		echo -n "Unable to determine current the source tree branch. Please verify that $SRC_PATH "
+		echo    "is a valid repository."
+		exit 1
+	fi
+	prompt_Yn "Keep the same branch, $branch?"
+	# if staying on the same branch
+	if [ $(confirm) ]; then
+		prompt_Yn 'Sync source tree?'
+		if [ $(confirm) ]; then
+			# back up GENERIC and UPDATING so that they can be compared post-sync
+			back_up_generic_and_updating
+			# sync source tree
+			if [ "$is_git_repository" ]; then
+				# TODO: switch to `make update` once Makefile migrates to Git
+				git fetch $GIT_FETCH_ARGS && git reset $GIT_RESET_ARGS origin/$branch || exit 1
+			else
+				NO_PORTSUPDATE=yes make update || exit 1
+			fi
+		fi
+	# if switching branches
+	else
+		branch_regexp='head|stable/[[:digit:]]+|releng/[[:digit:]]+\.[[:digit:]]+'
+		if [ "$is_git_repository" ]; then
+			prompt 'New branch (e.g. releng/xx.y):'
+			branch="$(input "$branch_regexp")"
+		else
+			prompt 'New repository URL (e.g. https://svn.freebsd.org/base/releng/xx.y):'
+			repository_url="$(input "https?://[-.[:alnum:]]+/base/($branch_regexp)/?")"
+		fi
+		# back up GENERIC and UPDATING so that they can be compared post-sync
+		back_up_generic_and_updating
+		# switch branches and sync source tree
+		if [ "$is_git_repository" ]; then
+			git fetch $GIT_FETCH_ARGS && git checkout "$branch" && \
+				git reset $GIT_RESET_ARGS origin/$branch || exit 1
+		else
+			svnlite switch "$repository_url" || exit 1
+		fi
+	fi
+
+	# if we have a backup of UPDATING and it differs from the latest, display the differences
+	if [ -f "$SRC_PATH/UPDATING.last" -a \
+			$(are_files_different "$SRC_PATH/UPDATING" "$SRC_PATH/UPDATING.last") ]; then
+		prompt_Yn 'See changes in UPDATING?'
+		if [ $(confirm) ]; then
+			diff -ruN "$SRC_PATH/UPDATING.last" "$SRC_PATH/UPDATING" | less --QUIT-AT-EOF
+		fi
+	# otherwise, offer to display the whole file
+	else
+		prompt_Yn 'Read UPDATING?'
+		if [ $(confirm) ]; then
+			less --QUIT-AT-EOF "$SRC_PATH/UPDATING"
+		fi
+	fi
+
+	# clean and build world
+	prompt_Yn "Build the userland (\`make $MAKE_ARGS buildworld\`)?"
+	if [ $(confirm) ]; then
+		if [ ! "$PREFER_ETCUPDATE" -o ! "$(is_etcupdate_functional)" ]; then
+			prompt_Yn "Merge pre-buildworld configuration with \`mergemaster $MERGEMASTER_ARGS -p\`?"
+			if [ $(confirm) ]; then
+				mergemaster $MERGEMASTER_ARGS -p || exit 1
+			fi
+		fi
+		no_clean_arg=
+		prompt_Yn 'Clean the build directory before building?'
+		if [ ! $(confirm) ]; then
+			no_clean_arg='-DNO_CLEAN'
+		fi
+		make $MAKE_ARGS $no_clean_arg buildworld || exit 1
+	fi
+
+	# build kernel
+	prompt_Yn "Build the $KERNCONF kernel (\`make $MAKE_ARGS buildkernel KERNCONF=$KERNCONF\`)?"
+	if [ $(confirm) ]; then
+		# if building a custom kernel configuration, merge changes from GENERIC into it
+		custom_kernconf="$KERNCONF_PATH/$KERNCONF"
+		generic_kernconf="$KERNCONF_PATH/GENERIC"
+		if [ "$KERNCONF" != 'GENERIC' -a \
+				$(are_files_different "$generic_kernconf" "$custom_kernconf") ]; then
+			three_way_merge_files "$generic_kernconf.last" "$generic_kernconf" "$custom_kernconf"
+		fi
+		# build
+		make $MAKE_ARGS buildkernel KERNCONF="$KERNCONF" || exit 1
+	fi
+
+	# install kernel
+	prompt_Yn "Install the $KERNCONF kernel (\`make installkernel KERNCONF=$KERNCONF\`)?"
+	if [ $(confirm) ]; then
+		make $MAKE_ARGS installkernel KERNCONF="$KERNCONF" || exit 1
+		prompt_Yn "Reboot and activate the new $KERNCONF kernel?"
+		if [ $(confirm) ]; then
+			echo; header "After the reboot, run \`$0 --stage2\` to continue."; echo
+			sleep 3
+			shutdown -r now
+		fi
+	fi
+}
+
+# installs world and merges configuration
+stage2() {
+	if [ "$PREFER_ETCUPDATE" -a "$(is_etcupdate_functional)" ]; then
+		prompt_Yn 'Merge pre-installworld configuration with `etcupdate -p`?'
+		if [ $(confirm) ]; then
+			etcupdate -p || exit 1
+		fi
+	fi
+
+	prompt_Yn 'Install the userland (`make installworld`)?'
+	world_installed=
+	if [ $(confirm) ]; then
+		make installworld || exit 1
+		world_installed=1
+	fi
+
+	if [ "$PREFER_ETCUPDATE" -a "$(is_etcupdate_functional)" ]; then
+		prompt_Yn 'Merge configuration files with `etcupdate -B`?'
+		if [ $(confirm) ]; then
+			etcupdate -B || exit 1
+		fi
+	else
+		prompt_Yn "Merge configuration files with \`mergemaster $MERGEMASTER_ARGS\`?"
+		if [ $(confirm) ]; then
+			mergemaster $MERGEMASTER_ARGS || exit 1
+		fi
+	fi
+
+	if [ "$world_installed" ]; then
+		prompt_Yn 'Reboot into the new userland?'
+		if [ $(confirm) ]; then
+			echo; header "After the reboot, run \`$0 --stage3\` to continue."; echo
+			sleep 3
+			shutdown -r now
+		fi
+	fi
+}
+
+# upgrades pkg(8) and cleans up after the build
+stage3() {
+	if [ "$(which pkg-static)" ]; then
+		prompt_Yn 'Upgrade pkg(8)?'
+		if [ $(confirm) ]; then
+			pkg-static install pkg || ASSUME_ALWAYS_YES=yes pkg-static bootstrap -f
+		fi
+	fi
+
+	prompt_Yn 'Clean up obsolete files and directories (`make delete-old`)?'
+	if [ $(confirm) ]; then
+		yes | make delete-old
+	fi
+
+	prompt 'Checking for obsolete shared libraries...'
+	redundant_shlibs="$(make check-old-libs)"
+	if [ ! "$redundant_shlibs" = ">>> Checking for old libraries" ]; then
+		echo 'none found.'
+	else
+		echo -e "$redundant_shlibs" | less --QUIT-AT-EOF
+		message='Delete ALL redundant shared libraries listed above?\n'
+		message="$message    WARNING: There may be ports still using some of these libraries."
+		prompt_yN "$message"
+		if [ $(confirm 'n') ]; then
+			yes | make delete-old-libs > /dev/null
+		else
+			prompt_Yn 'Interactively delete redundant shared libraries one at a time?'
+			if [ $(confirm) ]; then
+				make delete-old-libs
+			fi
+		fi
+	fi
+
+	message='Clean the build directory (`make cleanworld`)? Answer affirmatively if\n'
+	message="$message    you are satisfied with the upgrade and have no further use for the build\n"
+	message="$message    output (e.g. upgrading other hosts from the built binaries)."
+	prompt_yN "$message"
+	if [ $(confirm 'n') ]; then
+		make cleanworld
+	fi
+}
+
+# changes into the source directory and executes the requested stage
+stage_switchboard() {
+	cd "$SRC_PATH" || exit 1
+
+	# execute requested stage
+	case "$1" in
+		1)	check_etcupdate
+			stage1 "$2";;
+		2)	check_etcupdate
+			stage2;;
+		3)	stage3;;
+	esac
+}
+
+####################################################################################################
+# Entry point
+####################################################################################################
+
+case "$1" in
+	--stage1)	stage_switchboard 1 "$2";;
+	--stage2)	stage_switchboard 2;;
+	--stage3)	stage_switchboard 3;;
+	*)			print_usage
+				exit 1;;
+esac

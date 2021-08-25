@@ -1,0 +1,254 @@
+#!/bin/sh
+
+####################################################################################################
+# User-serviceable definitions
+####################################################################################################
+
+GIT_CLIENT_PACKAGE='git-tiny'
+GIT_FETCH_ARGS='--depth=1'
+GIT_RESET_ARGS='--keep'
+PORTMASTER_ARGS='-d -i --packages-if-newer'
+SAMPLE_PREFIXES='sample\.'
+#                ^ nano
+SAMPLE_SUBDIRS='example-config'
+#               ^ Dovecot
+SAMPLE_SUFFIXES='\.default|-development|\.dist|-production|\.sample'
+#                          ^ PHP               ^ PHP
+
+####################################################################################################
+# Internal definitions
+####################################################################################################
+
+CONFIG_PATH='/usr/local/etc'
+EXAMPLE_PATH='/usr/local/share/examples'
+MY_PATH="$(dirname $(readlink -f "$0"))"
+PORTMASTER_PATCH_PATH="$MY_PATH/portmaster.patch"
+PORTS_DB_PATH='/var/db/ports'
+PORTS_PATH='/usr/ports'
+SAMPLE_CONFIG_PATHS="$CONFIG_PATH $EXAMPLE_PATH"
+SRC_PATH='/usr/src'
+
+####################################################################################################
+# Utility functions
+####################################################################################################
+
+. "$MY_PATH/common"
+
+# creates .orig backups of sample configuration files
+back_up_sample_config_files() {
+	find_sample_config_files | awk '{ printf("-f %s %s.orig\n", $1, $1); }' | xargs -n 3 cp
+}
+
+# deletes .orig backups of sample configuration files
+delete_sample_config_file_backups() {
+	find_sample_config_files | awk '{ printf("-f %s.orig\n", $1, $1); }' | xargs -n 2 rm
+}
+
+# finds sample configuration files and returns their absolute paths
+find_sample_config_files() {
+	for sample_path in $SAMPLE_CONFIG_PATHS; do
+		set -- "$@" $sample_path
+	done
+	find -E "$@" -regex ".+(/($SAMPLE_PREFIXES).+|($SAMPLE_SUFFIXES)$|/($SAMPLE_SUBDIRS)/.+)" -type f
+}
+
+# determines whether portmaster has been patched for --packages-if-stock support
+is_portmaster_patched() {
+	portmaster --packages-if-stock --version > /dev/null
+	if [ $? -eq 0 ]; then
+		echo 1
+	fi
+}
+
+# given the path to a sample configuration file, returns the expected path of its local counterpart
+# $1: sample configuration file path
+local_config_file_path_from_sample() {
+	local_config_file_path=
+	# strip out any sample directory component
+	with_sample_dir_stripped="$(echo "$1" | sed -E "s/($SAMPLE_SUBDIRS)\///")"
+	# if the path contained a sample directory component
+	if [ "$with_sample_dir_stripped" != "$1" ]; then
+		# leave the file name untouched and use the path with the sample directory stripped out
+		local_config_file_path="$with_sample_dir_stripped"
+	# otherwise, if the file name contains a sample prefix or suffix (extension)
+	else
+		# strip out any sample prefix
+		with_prefix_stripped="$(strip_prefixes "$1" "$SAMPLE_PREFIXES")"
+		# if the file name contained a prefix, use the path with the prefix stripped out
+		if [ "$with_prefix_stripped" != "$1" ]; then
+			local_config_file_path="$with_prefix_stripped"
+		# otherwise, it must be a suffix (extension); return the path with the extension stripped
+		else
+			local_config_file_path="$(strip_extension "$1")"
+		fi
+	fi
+	# if the sample is located in the examples directory, map it to the configuration path
+	if [ "$(expr "$local_config_file_path" : "$EXAMPLE_PATH")" -gt 0 ]; then
+		escaped_example_path="$(escape_for_regexp "$EXAMPLE_PATH")"
+		escaped_config_path="$(escape_for_regexp "$CONFIG_PATH")"
+		local_config_file_path="$(echo $local_config_file_path | \
+			sed -e "s/$escaped_example_path/$escaped_config_path/")"
+		# if the sample is located in a subdirectory that doesn't have an equivalent in the
+		# configuration path (e.g. nano), strip out the subdirectory
+		with_file_name_stripped="$(strip_last_path_component "$local_config_file_path")"
+		if [ ! -d "$with_file_name_stripped" ]; then
+			file_name="$(file_name_from_path "$local_config_file_path")"
+			with_subdirectory_stripped="$(strip_last_path_component "${with_file_name_stripped%/}")"
+			echo "$with_subdirectory_stripped$file_name"
+		# otherwise, return the path as-is
+		else
+			echo "$local_config_file_path"
+		fi
+	# otherwise, if the sample is already in the configuration directory, return the path as-is
+	else
+		echo "$local_config_file_path"
+	fi
+}
+
+# merges configuration differences between old and new samples, and new samples and local files
+merge_config_files() {
+	differences_found=
+	sample_files="$(find_sample_config_files)"
+	IFS_backup="$IFS"; IFS='
+	'
+	for sample_file in $sample_files; do
+		# skip .default samples for which a .dist or .sample file is also available
+		base_file_name="$(strip_extension "$sample_file")"
+		case "$sample_file" in
+			*.default) [ -f "$base_file_name.dist" -o -f "$base_file_name.sample" ] && continue
+		esac
+
+		# derive this sample's local file path, and skip if no corresponding local file exists
+		# or if the sample and local files are identical
+		local_file="$(local_config_file_path_from_sample $sample_file)"
+		if [ ! -f "$local_file" -o ! $(are_files_different "$local_file" "$sample_file") ]; then
+			continue
+		fi
+
+		# merge differences between the sample's previous and current versions into the local copy
+		three_way_merge_files "$sample_file.orig" "$sample_file" "$local_file"
+		[ $? -ne 0 ] && differences_found=1
+	done
+	IFS="$IFS_backup"
+	if [ ! $differences_found ]; then
+		echo '    No inbound changes to merge.'
+	fi
+}
+
+####################################################################################################
+# Entry point
+####################################################################################################
+
+cd "$PORTS_PATH" || exit 1
+
+# sync ports tree
+prompt_Yn 'Sync ports tree?'
+if [ $(confirm) ]; then
+	# back up UPDATING so that it can be compared post-sync
+	if [ -f "$PORTS_PATH/UPDATING" ]; then
+		cp -fv "$PORTS_PATH/UPDATING" "$PORTS_PATH/UPDATING.last"
+	fi
+	# sync ports tree
+	if [ -d "$PORTS_PATH/.git" ]; then
+		check_git_client "$PORTS_PATH" "$GIT_CLIENT_PACKAGE" || exit 1
+		git fetch $GIT_FETCH_ARGS && git reset $GIT_RESET_ARGS origin/HEAD || exit 1
+	else
+		check_subversion_client || exit 1
+		make update || exit 1
+	fi
+fi
+
+# if we have a backup of UPDATING and it differs from the latest, display the differences
+if [ -f "$PORTS_PATH/UPDATING.last" -a \
+		$(are_files_different "$PORTS_PATH/UPDATING" "$PORTS_PATH/UPDATING.last") ]; then
+	prompt_Yn 'See changes in UPDATING?'
+	if [ $(confirm) ]; then
+		diff -ruN "$PORTS_PATH/UPDATING.last" "$PORTS_PATH/UPDATING" | less #--QUIT-AT-EOF
+	fi
+# otherwise, offer to display the whole file
+else
+	prompt_Yn 'Read UPDATING?'
+	if [ $(confirm) ]; then
+		less --QUIT-AT-EOF "$PORTS_PATH/UPDATING"
+	fi
+fi
+
+# back up sample configuration files for post-upgrade merging
+prompt_Yn "Back up ports' sample configuration files for post-upgrade merging?"
+if [ $(confirm) ]; then
+	back_up_sample_config_files
+fi
+
+# upgrade and patch portmaster(8)
+prompt_Yn 'Upgrade portmaster(8)?'
+if [ $(confirm) ]; then
+	pkg upgrade --yes portmaster || exit 1
+fi
+if [ -f "$PORTMASTER_PATCH_PATH" -a ! $(is_portmaster_patched) ]; then
+	message='This adds a --packages-if-stock switch which\n'
+	message="$message    selectively installs ports with stock configuration from binary packages\n"
+	message="$message    while building customized ports from source."
+	prompt_Yn "Patch portmaster(8)? $message"
+	if [ $(confirm) ]; then
+		patch --forward --strip 0 < "$PORTMASTER_PATCH_PATH" && \
+			pkg check --quiet --recompute portmaster  || exit 1
+	fi
+fi
+
+# upgrade ports
+if [ $(is_portmaster_patched) ]; then
+	package_switch='--packages-if-stock'
+	portmaster_type="patched portmaster(8) with $package_switch"
+else
+	package_switch='-P'
+	portmaster_type='stock portmaster(8)'
+fi
+prompt_Yn "Upgrade ports using $portmaster_type?"
+if [ $(confirm) ]; then
+	portmaster $PORTMASTER_ARGS -a $package_switch -x portmaster || exit 1
+fi
+
+# merge configuration files and delete backed-up samples
+prompt_Yn 'Merge inbound changes to sample configuration into local files?'
+if [ $(confirm) ]; then
+	merge_config_files || exit 1
+fi
+message="Delete backups of pre-upgrade sample configuration files? Answer\n"
+message="$message    affirmatively if you have merged all inbound changes."
+prompt_Yn "$message"
+if [ $(confirm) ]; then
+	delete_sample_config_file_backups
+fi
+
+# clean up leaf ports
+prompt_Yn 'Check for dependency-installed ports that may no longer be needed?'
+if [ $(confirm) ]; then
+	portmaster -s
+	pkg autoremove
+fi
+
+# clean up distfiles
+prompt_Yn 'Delete any and all obsolete distfiles?'
+if [ $(confirm) ]; then
+	portmaster --clean-distfiles -y
+fi
+
+# clean up packages
+prompt_Yn 'Delete any and all obsolete binary packages?'
+if [ $(confirm) ]; then
+	portmaster --clean-packages -y
+fi
+
+# clean up port configuration directories
+prompt_Yn "Check for orphaned configuration directories in $PORTS_DB_PATH?"
+if [ $(confirm) ]; then
+	portmaster --check-port-dbdir
+fi
+
+# run sanity checks
+prompt_Yn 'Check ports for checksum, dependency, and shared library problems?'
+if [ $(confirm) ]; then
+	pkg check --checksums -a
+	pkg check --dependencies -a
+	pkg check --shlibs -a
+fi
