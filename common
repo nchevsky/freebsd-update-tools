@@ -92,7 +92,7 @@ file_name_from_path() {
 header() {
 	columns=$(console_width)
 	repeat '=' "$((columns - 1))"
-	echo "\n$1"
+	echo -e "\n$1"
 	repeat '=' "$((columns - 1))"
 }
 

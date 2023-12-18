@@ -238,7 +238,14 @@ stage2() {
 	if [ "$PREFER_ETCUPDATE" -a "$(is_etcupdate_functional)" ]; then
 		prompt_Yn 'Merge configuration files with `etcupdate -B`?'
 		if [ $(confirm) ]; then
-			etcupdate -B || exit 1
+			etcupdate -B || (
+				prompt_Yn 'Resolve conflicts with `etcupdate resolve`?'
+				if [ $(confirm) ]; then
+					etcupdate resolve || exit 1
+				else
+					exit 1
+				fi
+			)
 		fi
 	else
 		prompt_Yn "Merge configuration files with \`mergemaster $MERGEMASTER_ARGS\`?"
